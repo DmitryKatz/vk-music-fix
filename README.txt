@@ -21,6 +21,7 @@
   – «Скопировать отчёт» — короткая версия в буфер.
   Ссылки в логах обрезаются до адреса без параметров — токенов там нет.
 
+https://sun9-48.vkuserphoto.ru/s/v1/ig2/J13o5-hGtHCwb113K0A17sRPdsyFts2WAR6Ve5bDf29m9Uu-j87IwwZIFY4LXrcPt2wlUEcBi0MJ3QvicCX3QQGk.jpg?quality=95&as=32x51,48x77,72x115,108x173,160x256,240x384,360x576,480x768&from=bu&u=fZbQvFPNxhga70PfUSE9kY59Ab7es_2B1jattPSwJzM&cs=480x0
 
 УСТАНОВКА / ОБНОВЛЕНИЕ
 
