@@ -200,9 +200,11 @@
       const tr = api.track();
       setV('track', tr ? tr.text : '—');
       setV('vk', `ошибок плеера ${st.vkErrors} · авто-пропусков ${st.autoSkips}` + (st.fastSkips ? ` · странных скипов ${st.fastSkips}` : '') + ` · смен трека ${st.trackChanges}`);
-      setV('buffer', `ожиданий ${st.waiting} · подвисаний ${st.stalled} · ошибок медиа ${st.mediaErrors}` + (st.mseErrors ? ` · MSE ${st.mseErrors}` : ''));
-      setV('net', `аудио: ок ${n.reqOk} · сбоев ${n.reqFail} · медленных ${n.reqSlow} · отменено ${n.reqAbort}` +
-        ` · сайт: сбоев ${n.otherFail + st.resFails}`);
+      setV('buffer', `ожиданий ${st.waiting} · подвисаний ${st.stalled}` + (st.stuck ? ` · стояний на месте ${st.stuck}` : '') +
+        ` · ошибок медиа ${st.mediaErrors}` + (st.mseErrors ? ` · MSE ${st.mseErrors}` : ''));
+      const cut = (n.blocked || 0) + st.resFails;
+      setV('net', `аудио: ок ${n.reqOk} · сбоев ${n.reqFail + n.failed} · медленных ${n.reqSlow} · отменено ${n.reqAbort}` +
+        (cut ? ` · сторонних отрезано ${cut} (реклама/стата — на музыку не влияет)` : ''));
       const types = Object.entries(st.resTypes).map(([k, v]) => `${k} ${v}`).join(', ');
       const via = [n.viaXhr && `xhr ${n.viaXhr}`, n.viaFetch && `fetch ${n.viaFetch}`, types].filter(Boolean).join(', ');
       setV('how', `m3u8 ${n.m3u8} · плеер: ${via || 'аудио-запросов не видно'} · MSE: ${st.mse.join(', ') || 'нет'}` +
@@ -219,10 +221,11 @@
       $('[data-a="file-stop"]').hidden = f.state === 'off';
 
       let h = '';
-      const netBad = n.reqFail + n.otherFail + st.resFails;
+      const bad = Object.entries(n.badHosts || {}).sort((a, b) => b[1] - a[1]);
       if (st.autoSkips && !s.undoSkip) h = 'ВК сам перескакивает на следующий трек после своих ошибок — включи «Возврат трека после сбоя ВК».';
       else if (f.state === 'paused') h = 'Запись лога в файл на паузе — нажми «Продолжить запись».';
-      else if (netBad >= 3) h = `Сеть до серверов ВК сбоит: ${netBad} неудачных запросов. Скорее всего, подвисания и сбои плеера отсюда — в логе видно, какие именно.`;
+      else if (bad.length) h = `Сервер с музыкой тормозит или не отвечает: ${bad.slice(0, 3).map(([k, v]) => `${k} (${v})`).join(', ')}. ` +
+        'Это на стороне ВК или провайдера — из-за таких серверов плеер ВК и падает. Расширение их обходит: остальные треки их не ждут.';
       else if (st.fastSkips && !s.playFix) h = 'Видны самопроизвольные скипы — включи «Фикс AbortError».';
       else if (st.trackChanges >= 2 && !n.m3u8 && st.directSrc && s.cache)
         h = 'ВК играет файл по прямой ссылке через <audio> — кеш этот поток не перехватывает.';

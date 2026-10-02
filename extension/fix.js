@@ -13,7 +13,7 @@
   'use strict';
   if (window.__vkfix) return;
 
-  const VERSION = '1.1.0';
+  const VERSION = '1.2.0';
   const SESSION = Math.random().toString(36).slice(2, 7);
   const LS_KEY = 'vkfix:settings';
   const DEFAULTS = { playFix: true, undoSkip: true, cache: true, verbose: false, workerHook: false, panel: false };
@@ -268,7 +268,7 @@
     vkErrors: 0, autoSkips: 0, undone: 0, restoredPos: 0, fastSkips: 0, trackChanges: 0,
     mediaEls: 0, mediaErrors: 0, waiting: 0, stalled: 0,
     directSrc: 0, blobSrc: 0, mse: [], mseErrors: 0, workers: [],
-    resFails: 0, jsErrors: 0, resTypes: {},
+    resFails: 0, jsErrors: 0, resTypes: {}, seeks: 0, stuck: 0,
   };
 
   // ------------------------------------------------------------------ консоль: ошибки ВК
@@ -285,11 +285,19 @@
     return 0;
   }
 
+  function ranges(el) {
+    try {
+      const b = el.buffered, out = [];
+      for (let i = 0; i < b.length && i < 5; i++) out.push(`${b.start(i).toFixed(2)}–${b.end(i).toFixed(1)}`);
+      return out.length ? '[' + out.join(', ') + (b.length > 5 ? ', …' : '') + ']' : '[пусто]';
+    } catch { return '[?]'; }
+  }
+
   function snapshot(el) {
     if (!el) return 'медиа-элемент не найден';
     let s = '';
     try {
-      s = `позиция ${fmtPos(el.currentTime)}, буфер впереди ${bufferAhead(el).toFixed(1)} с, ` +
+      s = `позиция ${fmtPos(el.currentTime)} (${el.currentTime.toFixed(2)}), буфер впереди ${bufferAhead(el).toFixed(1)} с, загружено ${ranges(el)}, ` +
         `paused=${el.paused}, readyState=${el.readyState}, networkState=${el.networkState}` +
         (el.error ? `, error=${el.error.code} ${el.error.message || ''}` : '');
     } catch {}
@@ -332,12 +340,16 @@
     };
   }
 
+  const resSeen = new Set();
   window.addEventListener('error', e => {
     const t = e.target;
     if (t && t !== window && t.tagName) {
       if (t.tagName === 'IMG') return;
       stats.resFails++;
-      log('res', `не загрузился <${t.tagName.toLowerCase()}>: ${short(t.src || t.href || '')}`);
+      const u = short(t.src || t.href || '');
+      if (resSeen.has(u) && !settings.verbose) return;
+      resSeen.add(u);
+      log('res', `не загрузился <${t.tagName.toLowerCase()}>: ${u}`);
     } else if (e.message) {
       stats.jsErrors++;
       log('jserr', `${e.message} @ ${short(e.filename || '')}:${e.lineno}${e.error ? '\n' + ser(e.error) : ''}`);
@@ -362,23 +374,33 @@
     return lines.length ? '\n        ← ' + lines.join('\n        ← ') : '';
   }
 
+  const allEls = new Set();
+  const anotherPlaying = el => [...allEls].some(x => x !== el && !x.paused && !x.ended);
+
   function watch(el) {
     if (seen.has(el)) return seen.get(el);
     const tag = el.tagName.toLowerCase() + '#' + (++stats.mediaEls);
     seen.set(el, tag);
+    allEls.add(el);
     log('media', `найден ${tag}${el.isConnected ? '' : ' (создан в памяти)'}`);
     const quiet = new Set(['loadstart', 'loadedmetadata', 'canplay', 'seeking', 'seeked']);
     for (const ev of ['loadstart', 'loadedmetadata', 'canplay', 'play', 'playing', 'pause', 'waiting',
                       'stalled', 'seeking', 'seeked', 'ended', 'error', 'emptied', 'abort']) {
       el.addEventListener(ev, () => {
-        if (ev === 'play' || ev === 'playing' || ev === 'loadstart') activeEl = el;
+        if (ev === 'play' || ev === 'playing') activeEl = el;
+        // предзагрузка следующего трека тоже шлёт loadstart — активным её не считаем, пока что-то играет
+        if (ev === 'loadstart' && (!activeEl || activeEl.paused) && !anotherPlaying(el)) activeEl = el;
         if (ev === 'waiting') stats.waiting++;
         if (ev === 'stalled') stats.stalled++;
         if (ev === 'playing') onPlaying(el, tag);
         if (ev === 'error') {
-          stats.mediaErrors++;
           const er = el.error;
-          log('err', `${tag}: ошибка медиа code=${er && er.code} ${er && er.message || ''}`);
+          if (er && /empty src/i.test(er.message || '')) {     // ВК создаёт пустые элементы — это не сбой
+            if (settings.verbose) log('media', `${tag}: пустой src (штатно)`);
+            return;
+          }
+          stats.mediaErrors++;
+          log('err', `${tag}: ошибка медиа code=${er && er.code} ${er && er.message || ''} · ${snapshot(el)}`);
           return;
         }
         if (ev === 'play') return;
@@ -386,7 +408,7 @@
         let extra = '';
         try {
           extra = ` t=${el.currentTime.toFixed(1)}`;
-          if (ev === 'waiting' || ev === 'stalled') extra += `, буфер впереди ${bufferAhead(el).toFixed(1)} с`;
+          if (ev === 'waiting' || ev === 'stalled') extra += `, буфер впереди ${bufferAhead(el).toFixed(1)} с, загружено ${ranges(el)}`;
         } catch {}
         log(ev === 'waiting' || ev === 'stalled' ? 'warn' : 'media', `${tag}: ${ev}${extra}`);
       });
@@ -428,14 +450,18 @@
         if (!byLoad) return undefined;
         return new Promise(resolve => {
           let done = false;
-          const finish = () => { if (!done) { done = true; resolve(); } };
-          const go = () => origPlay.call(el).then(() => {
-            stats.resumed++;
-            log('fix', `${tag}: трек запущен после прерывания`);
-            finish();
-          }, finish);
+          const finish = () => { if (!done) { done = true; el.removeEventListener('canplay', go); resolve(); } };
+          const go = () => {
+            if (done) return;
+            if (anotherPlaying(el)) { finish(); return; }        // уже играет другой элемент — не мешаем
+            origPlay.call(el).then(() => {
+              stats.resumed++;
+              log('fix', `${tag}: трек запущен после прерывания`);
+              finish();
+            }, finish);
+          };
           el.addEventListener('canplay', go, { once: true });
-          setTimeout(finish, 5000);
+          setTimeout(finish, 4000);
         });
       }
       stats.playErrors++;
@@ -460,6 +486,48 @@
       set(v) { noteSrc(this, v); srcDesc.set.call(this, v); },
     });
   }
+  const ctDesc = Object.getOwnPropertyDescriptor(MP, 'currentTime');
+  if (ctDesc && ctDesc.set) {
+    Object.defineProperty(MP, 'currentTime', {
+      configurable: true,
+      enumerable: ctDesc.enumerable,
+      get() { return ctDesc.get.call(this); },
+      set(v) {
+        try {
+          const from = ctDesc.get.call(this);
+          if (Math.abs(from - v) > 1 || settings.verbose) {
+            stats.seeks++;
+            log('media', `${watch(this)}: перемотка ${from.toFixed(2)} → ${(+v).toFixed(2)}${settings.verbose ? stackTop() : ''}`);
+          }
+        } catch {}
+        ctDesc.set.call(this, v);
+      },
+    });
+  }
+
+  // детектор «играет, но стоит на месте»
+  let stuckEl = null, stuckT = -1, stuckFor = 0, stuckLogged = false;
+  setInterval(() => {
+    const el = activeEl;
+    if (!el) return;
+    if (el !== stuckEl) { stuckEl = el; stuckT = -1; stuckFor = 0; stuckLogged = false; }
+    let t;
+    try { t = el.currentTime; } catch { return; }
+    if (el.paused || el.ended || el.seeking || t !== stuckT) {
+      if (stuckLogged) log('info', `${seen.get(el)}: поехало дальше после ${stuckFor} с стояния`);
+      stuckT = t; stuckFor = 0; stuckLogged = false;
+      return;
+    }
+    stuckFor++;
+    if (stuckFor >= 5 && !stuckLogged) {
+      stuckLogged = true;
+      stats.stuck++;
+      let extra = '';
+      try { extra = `, rate=${el.playbackRate}, muted=${el.muted}, volume=${el.volume.toFixed(2)}`; } catch {}
+      log('warn', `${seen.get(el)}: «играет», но стоит на месте уже 5 с — ${snapshot(el)}${extra}`);
+    }
+  }, 1000);
+
   const origSetAttr = Element.prototype.setAttribute;
   Element.prototype.setAttribute = function (name, value) {
     if (this instanceof HTMLMediaElement && String(name).toLowerCase() === 'src') noteSrc(this, value);
@@ -512,17 +580,29 @@
                 retries: 0, failed: 0, fullTracks: 0, reqOk: 0, reqFail: 0, reqSlow: 0, reqAbort: 0, otherFail: 0,
                 viaXhr: 0, viaFetch: 0 };
     const PL_RE = /\.m3u8(?:[?#]|$)/i;
-    const THREADS = 3, TRIES = 6, MAX_PL = 4;
+    const THREADS = 3;            // всего фоновых загрузок одновременно
+    const PER_HOST = 2;           // с одного сервера — не больше двух: зависший узел не съест всё
+    const TRIES = 3;
+    const ATTEMPT_TIMEOUT = 15000; // одна попытка скачать файл
+    const PLAYER_WAIT = 3000;      // плеер ждёт нашу загрузку максимум 3 с, потом качает сам
+    const HOST_PAUSE = 120000;     // сервер, который дважды не ответил, 2 минуты не трогаем
+    const MAX_PL = 4;
     const cache = new Map();
     const known = new Set();            // все адреса из увиденных плейлистов (для лога, даже при выключенном кеше)
     const playlists = [];
-    const queue = [];
-    let active = 0, otherLogged = 0;
+    let queue = [];
+    let active = 0;
+    const hostActive = new Map();
+    const hostHealth = new Map();       // host → { fails: [время], pausedUntil }
+    S.badHosts = {};                    // host → сколько раз тормозил/падал (для панели)
+    S.blocked = 0;                      // сторонние запросы, отрезанные за доли секунды (обычно блокировщик рекламы)
+    let blockedNoted = false, otherLogged = 0;
     const realFetch = typeof G.fetch === 'function' ? G.fetch : null;
     const XP = G.XMLHttpRequest && G.XMLHttpRequest.prototype;
     const sleep = ms => new Promise(r => setTimeout(r, ms));
     const base = () => { try { return G.location.href; } catch { return undefined; } };
     const abs = (u, b) => { try { return new URL(String(u), b).href; } catch { return null; } };
+    const hostOf = u => { try { return new URL(u).host; } catch { return ''; } };
     const short = u => {
       try { const x = new URL(u); return x.host + '/…/' + (x.pathname.split('/').filter(Boolean).pop() || ''); }
       catch { return String(u).slice(0, 60); }
@@ -533,6 +613,8 @@
       try { return /audio/i.test(new URL(u).host); } catch { return false; }
     };
 
+    function noteBadHost(h) { S.badHosts[h] = (S.badHosts[h] || 0) + 1; }
+
     function noteResult(url, status, ms, how) {
       const audio = isAudio(url);
       if (how === 'abort') {
@@ -541,42 +623,80 @@
       }
       const ok = status >= 200 && status < 400;
       if (!audio) {
-        if (!ok && (status === 0 || status >= 500)) {
+        if (ok || (status !== 0 && status < 500)) return;
+        if (status === 0 && ms < 400) {
+          S.blocked++;
+          if (!blockedNoted) {
+            blockedNoted = true;
+            report('info', `сторонние запросы (реклама/статистика) обрываются за доли секунды — похоже на блокировщик рекламы, на музыку не влияет. Пример: ${short(url)}`);
+          } else if (cfg.verbose) report('net', `заблокирован: ${short(url)} за ${ms} мс`);
+        } else {
           S.otherFail++;
-          if (otherLogged++ < 50) report('net', `сбой запроса сайта: ${short(url)} → ${status || 'нет ответа'} за ${ms} мс`);
+          if (cfg.verbose || otherLogged++ < 10) report('net', `сбой запроса сайта: ${short(url)} → ${status || 'нет ответа'} за ${ms} мс`);
         }
         return;
       }
       if (ok) {
         S.reqOk++;
-        if (ms > 4000) { S.reqSlow++; report('net', `медленно: ${short(url)} → ${status} за ${ms} мс`); }
-        else if (cfg.verbose || PL_RE.test(url)) report('net', `${short(url)} → ${status} за ${ms} мс`);
+        if (ms > 4000) {
+          S.reqSlow++;
+          noteBadHost(hostOf(url));
+          report('net', `медленно: ${short(url)} → ${status} за ${ms} мс`);
+        } else if (cfg.verbose || PL_RE.test(url)) report('net', `${short(url)} → ${status} за ${ms} мс`);
       } else {
         S.reqFail++;
+        noteBadHost(hostOf(url));
         report('err', `запрос плеера не прошёл: ${short(url)} → ${status || 'нет ответа (сеть/CORS)'}${how === 'timeout' ? ' (таймаут)' : ''} за ${ms} мс`);
       }
     }
 
-    async function download(url, withCreds) {
-      let delay = 400, last;
+    function hostPaused(h) {
+      const hh = hostHealth.get(h);
+      return !!(hh && hh.pausedUntil > Date.now());
+    }
+
+    function hostFailed(h) {
+      const now = Date.now();
+      const hh = hostHealth.get(h) || { fails: [], pausedUntil: 0 };
+      hh.fails = hh.fails.filter(t => now - t < HOST_PAUSE).concat(now);
+      hostHealth.set(h, hh);
+      noteBadHost(h);
+      if (hh.fails.length >= 2 && hh.pausedUntil < now) {
+        hh.pausedUntil = now + HOST_PAUSE;
+        report('warn', `сервер ${h} не отвечает — 2 минуты не качаю с него заранее, плеер берёт файлы сам`);
+        for (const [, e] of cache) {
+          if (e.host === h && e.state === 'queued') { e.state = 'skip'; e.resolve(); }
+        }
+      }
+    }
+
+    async function download(url, e) {
+      let delay = 500, last;
       for (let i = 0; i < TRIES; i++) {
+        if (hostPaused(e.host)) { const x = new Error('сервер на паузе'); x.skip = true; throw x; }
+        if (e.state !== 'loading') { const x = new Error('уже не нужен'); x.skip = true; throw x; }
+        const ac = typeof AbortController === 'function' ? new AbortController() : null;
+        const timer = ac ? setTimeout(() => ac.abort(), ATTEMPT_TIMEOUT) : null;
         try {
-          const r = await realFetch.call(G, url, { credentials: withCreds ? 'include' : 'omit' });
+          const r = await realFetch.call(G, url, { credentials: e.creds ? 'include' : 'omit', signal: ac ? ac.signal : undefined });
           if ([401, 403, 404, 410].includes(r.status)) {
-            const e = new Error('HTTP ' + r.status);
-            e.fatal = true;
-            throw e;
+            const x = new Error('HTTP ' + r.status);
+            x.fatal = true;
+            throw x;
           }
           if (!r.ok) throw new Error('HTTP ' + r.status);
           const buf = await r.arrayBuffer();
           const len = +r.headers.get('content-length');
           if (len && buf.byteLength < len) throw new Error(`обрыв на ${buf.byteLength}/${len} байт`);
           return { buf, type: r.headers.get('content-type') || '' };
-        } catch (e) {
-          if (e.fatal) throw e;
-          last = e;
+        } catch (err) {
+          if (err.fatal) throw err;
+          last = err && err.name === 'AbortError' ? new Error(`нет ответа ${ATTEMPT_TIMEOUT / 1000} с`) : err;
           S.retries++;
-          report('net', `кеш: повтор ${i + 1}/${TRIES} для ${short(url)} (${e.message})`);
+          if (!/^HTTP /.test(last.message)) hostFailed(e.host);
+          report('net', `кеш: попытка ${i + 1}/${TRIES} для ${short(url)} не удалась (${last.message})`);
+        } finally {
+          if (timer) clearTimeout(timer);
         }
         await sleep(delay);
         delay = Math.min(delay * 2, 4000);
@@ -584,47 +704,53 @@
       throw last || new Error('сеть не отвечает');
     }
 
-    function entry(url) {
+    function entry(url, creds) {
       let e = cache.get(url);
       if (!e) {
         let resolve;
         const done = new Promise(r => { resolve = r; });
-        e = { state: 'queued', done, resolve, data: null, type: '', creds: false };
+        e = { state: 'queued', done, resolve, data: null, type: '', creds: !!creds, host: hostOf(url) };
         cache.set(url, e);
-        queue.push(url);
       }
       return e;
     }
-    function bump(url) {
-      const i = queue.indexOf(url);
-      if (i > 0) { queue.splice(i, 1); queue.unshift(url); }
-      pump();
+
+    function startDownload(url, e) {
+      e.state = 'loading';
+      active++;
+      hostActive.set(e.host, (hostActive.get(e.host) || 0) + 1);
+      download(url, e).then(({ buf, type }) => {
+        e.data = buf;
+        e.type = type;
+        e.state = 'ok';
+        S.filesOk++;
+        S.bytes += buf.byteLength;
+        checkFull();
+      }, err => {
+        if (err.skip) { if (e.state === 'loading') e.state = 'skip'; return; }
+        e.state = 'fail';
+        S.failed++;
+        report('err', `кеш: не скачался ${short(url)}: ${err.message} — плеер возьмёт его из сети сам`);
+      }).finally(() => {
+        active--;
+        hostActive.set(e.host, hostActive.get(e.host) - 1);
+        e.resolve();
+        pump();
+      });
     }
+
     function pump() {
-      while (active < THREADS && queue.length) {
-        const url = queue.shift();
+      for (let i = 0; i < queue.length && active < THREADS;) {
+        const url = queue[i];
         const e = cache.get(url);
-        if (!e || e.state !== 'queued') continue;
-        e.state = 'loading';
-        active++;
-        download(url, e.creds).then(({ buf, type }) => {
-          e.data = buf;
-          e.type = type;
-          e.state = 'ok';
-          S.filesOk++;
-          S.bytes += buf.byteLength;
-          checkFull();
-        }, err => {
-          e.state = 'fail';
-          S.failed++;
-          report('err', `кеш: не скачался ${short(url)}: ${err.message} — плеер возьмёт его из сети сам`);
-        }).finally(() => {
-          active--;
-          e.resolve();
-          pump();
-        });
+        if (!e || e.state !== 'queued') { queue.splice(i, 1); continue; }
+        if (hostPaused(e.host)) { e.state = 'skip'; e.resolve(); queue.splice(i, 1); continue; }
+        if ((hostActive.get(e.host) || 0) >= PER_HOST) { i++; continue; }
+        queue.splice(i, 1);
+        startDownload(url, e);
       }
     }
+
     function checkFull() {
       for (const p of playlists) {
         if (p.full) continue;
@@ -636,14 +762,21 @@
         }
       }
     }
+
     function evict(p) {
       const keep = new Set();
       for (const x of playlists) for (const u of x.items) keep.add(u);
       for (const u of p.items) {
         if (keep.has(u)) continue;
         const e = cache.get(u);
-        if (e) { if (e.data) S.bytes -= e.data.byteLength; cache.delete(u); }
+        if (e) {
+          if (e.data) S.bytes -= e.data.byteLength;
+          if (e.state === 'queued' || e.state === 'loading') e.state = 'skip';
+          e.resolve();
+          cache.delete(u);
+        }
       }
+      queue = queue.filter(u => cache.has(u));
     }
 
     function onPlaylist(url, text, withCreds) {
@@ -672,17 +805,41 @@
       for (const u of items) known.add(u);
       report('net', `плейлист ${short(url)}: ${items.length} файлов, ${Math.round(dur)} с`);
       if (!cfg.cache || !items.length) return;
+      const h = hostOf(items[items.length - 1]);
+      if (hostPaused(h)) { report('net', `кеш: ${h} на паузе — этот трек плеер грузит сам`); return; }
       const prev = playlists.find(p => p.url === url);
-      if (prev) { playlists.splice(playlists.indexOf(prev), 1); playlists.push(prev); return; }
-      playlists.push({ url, items, t0: Date.now(), full: false });
-      S.playlists++;
-      S.files += items.length;
-      for (const u of items) entry(u).creds = !!withCreds;
-      while (playlists.length > MAX_PL) evict(playlists.shift());
-      report('cache', `кеш: качаю трек целиком (${items.length} файлов)`);
+      if (prev) { playlists.splice(playlists.indexOf(prev), 1); playlists.push(prev); }
+      else {
+        playlists.push({ url, items, t0: Date.now(), full: false });
+        S.playlists++;
+        S.files += items.length;
+        while (playlists.length > MAX_PL) evict(playlists.shift());
+        report('cache', `кеш: качаю трек целиком (${items.length} файлов)`);
+      }
+      // свежий плейлист — это трек, который сейчас нужен: его файлы встают в начало очереди
+      const fresh = [];
+      for (const u of items) {
+        const e = entry(u, withCreds);
+        if (e.state === 'queued') fresh.push(u);
+      }
+      const set = new Set(fresh);
+      queue = fresh.concat(queue.filter(u => !set.has(u)));
       pump();
       checkFull();
     }
+
+    /** Что делать с запросом плеера: отдать из кеша, подождать нашу загрузку или пустить в сеть. */
+    function decide(e) {
+      if (!e) return 'net';
+      if (e.state === 'ok') return 'hit';
+      if (e.state === 'loading') return 'wait';
+      if (e.state === 'queued') {          // мы до файла ещё не дошли — пусть плеер берёт сам, не ждём очередь
+        e.state = 'player';
+        e.resolve();
+      }
+      return 'net';
+    }
+    const waitShort = e => Promise.race([e.done, sleep(PLAYER_WAIT)]);
 
     function abortable(p, signal) {
       if (!signal) return p;
@@ -725,12 +882,12 @@
           });
         }
         const e = cfg.cache ? cache.get(url) : null;
-        if (!e) return tracked();
+        const d = decide(e);
+        if (d === 'net') { if (e) S.misses++; return tracked(); }
         return (async () => {
-          if (e.state === 'queued' || e.state === 'loading') {
+          if (d === 'wait') {
             S.waits++;
-            bump(url);
-            await abortable(e.done, signal);
+            await abortable(waitShort(e), signal);
           }
           if (e.state === 'ok') {
             S.hits++;
@@ -743,6 +900,7 @@
             return r;
           }
           S.misses++;
+          if (cfg.verbose) report('net', `кеш не успел (${short(url)}) — плеер качает сам`);
           return tracked();
         })();
       };
@@ -837,7 +995,8 @@
         if (st && st.url && isAudio(st.url)) S.viaXhr++;
         if (!st || !cfg.cache || st.method !== 'GET' || !st.async || st.range || !st.url) return nativeSend(this, st || {}, args);
         const e = cache.get(st.url);
-        if (!e) return nativeSend(this, st, args);
+        const d = decide(e);
+        if (d === 'net') { if (e) S.misses++; return nativeSend(this, st, args); }
         const xhr = this;
         const finish = () => {
           if (st.aborted || xhr.__vf !== st) return;
@@ -847,12 +1006,12 @@
             return;
           }
           S.misses++;
+          if (cfg.verbose) report('net', `кеш не успел (${short(st.url)}) — плеер качает сам`);
           nativeSend(xhr, st, args);    // запрос всё ещё в состоянии OPENED — отправляем как было
         };
-        if (e.state === 'ok' || e.state === 'fail') { setTimeout(finish, 0); return undefined; }
+        if (d === 'hit') { setTimeout(finish, 0); return undefined; }
         S.waits++;
-        bump(st.url);
-        e.done.then(finish);
+        waitShort(e).then(finish);
         return undefined;
       };
     }
@@ -1040,7 +1199,11 @@
 
   function netTotals() {
     const t = Object.assign({}, net.S);
-    for (const s of workerStats.values()) for (const k in t) t[k] += s[k] || 0;
+    t.badHosts = Object.assign({}, net.S.badHosts);
+    for (const s of workerStats.values()) {
+      for (const k in t) if (typeof t[k] === 'number') t[k] += s[k] || 0;
+      for (const h in s.badHosts || {}) t.badHosts[h] = (t.badHosts[h] || 0) + s.badHosts[h];
+    }
     return t;
   }
 
